@@ -691,8 +691,9 @@ fn extract_host_and_port(uri: &str) -> (String, u16) {
     let default_port = 8020;
 
     let stripped_uri = strip_supported_scheme(uri).unwrap_or(uri);
+    let authority = stripped_uri.split('/').next().unwrap_or("");
 
-    let mut parts = stripped_uri.split(':');
+    let mut parts = authority.split(':');
     let host = parts.next().unwrap_or("").to_string();
     let port = parts
         .next()
@@ -766,5 +767,26 @@ impl Drop for ReadRangeStream {
                 self.file_pointer.load(Ordering::SeqCst),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_host_and_port;
+
+    #[test]
+    fn host_and_port_ignore_the_path() {
+        assert_eq!(
+            extract_host_and_port("hdfs://localhost:43313/tbl/_delta_log"),
+            ("localhost".to_string(), 43313)
+        );
+        assert_eq!(
+            extract_host_and_port("hdfs://nn.example:9000"),
+            ("nn.example".to_string(), 9000)
+        );
+        assert_eq!(
+            extract_host_and_port("hdfs://nn.example/tbl"),
+            ("nn.example".to_string(), 8020)
+        );
     }
 }
