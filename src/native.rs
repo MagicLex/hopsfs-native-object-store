@@ -71,6 +71,9 @@ pub struct hdfsFileInfo {
     pub mLastAccess: tTime,
 }
 
+/// `hdfsRename2` flag: fail with EEXIST when the destination exists.
+pub const HDFS_RENAME_NOREPLACE: c_int = 1;
+
 #[link(name = "hdfs")]
 unsafe extern "C" {
 
@@ -327,8 +330,8 @@ unsafe extern "C" {
     /// @param path The full path to the file.
     /// @param flags - an | of bits/fcntl.h file flags - supported flags are O_RDONLY,
     /// O_WRONLY (meaning create or overwrite i.e., implies O_TRUNCAT),
-    /// O_WRONLY|O_APPEND. Other flags are generally ignored other than
-    /// (O_RDWR || (O_EXCL & O_CREAT)) which return NULL and set errno equal ENOTSUP.
+    /// O_WRONLY|O_APPEND, and O_WRONLY|O_CREAT|O_EXCL (create only if the path does
+    /// not exist, else NULL with errno EEXIST). O_RDWR returns NULL with errno ENOTSUP.
     /// @param bufferSize Size of buffer for read/write - pass 0 if you want
     /// to use the default configured values.
     /// @param replication Block replication - pass 0 if you want to use
@@ -550,6 +553,19 @@ unsafe extern "C" {
     /// #### Return
     /// Returns 0 on success, -1 on error.
     pub fn hdfsRename(fs: *const hdfsFS, oldPath: *const c_char, newPath: *const c_char) -> c_int;
+
+    /// Rename file with options, in one namenode call. `hdfsRename` replaces an existing
+    /// destination; with `flags` = [HDFS_RENAME_NOREPLACE] the namenode fails the rename with
+    /// errno EEXIST when `newPath` exists, atomically.
+    ///
+    /// #### Return
+    /// Returns 0 on success, -1 on error.
+    pub fn hdfsRename2(
+        fs: *const hdfsFS,
+        oldPath: *const c_char,
+        newPath: *const c_char,
+        flags: c_int,
+    ) -> c_int;
 
     /// Get the current working directory for the given filesystem.
     ///

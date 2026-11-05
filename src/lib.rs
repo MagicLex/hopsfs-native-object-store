@@ -275,15 +275,23 @@ impl ObjectStore for HdfsObjectStore {
 
         let (tmp_file, tmp_file_path) = self.open_tmp_file(&final_file_path).await?;
 
-        for bytes in payload {
-            tmp_file.hdfs_write(bytes).await.to_object_store_err()?;
+        let written = async {
+            for bytes in payload {
+                tmp_file.hdfs_write(bytes).await?;
+            }
+            tmp_file.close_file().await?;
+            // Without overwrite the namenode renames only onto a missing path, so of two
+            // writers creating the same path (a Delta log commit) exactly one wins.
+            self.client
+                .rename(&tmp_file_path, &final_file_path, overwrite)
+                .await
         }
-        tmp_file.close_file().await.to_object_store_err()?;
-
-        self.client
-            .rename(&tmp_file_path, &final_file_path, overwrite)
-            .await
-            .to_object_store_err()?;
+        .await;
+        if let Err(e) = written {
+            drop(tmp_file);
+            let _ = self.client.delete(&tmp_file_path, false).await;
+            return Err(e).to_object_store_err();
+        }
 
         let e_tag = self.head(location).await?.e_tag;
 

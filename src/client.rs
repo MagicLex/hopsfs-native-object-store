@@ -1,4 +1,4 @@
-use libc::{O_RDONLY, O_WRONLY};
+use libc::{O_CREAT, O_EXCL, O_RDONLY, O_WRONLY};
 use std::ffi::{CStr, CString};
 
 use crate::native;
@@ -95,6 +95,12 @@ fn strip_scheme_authority(path: &str) -> &str {
         Some(i) => &after_authority[i..],
         None => "/",
     }
+}
+
+/// errno of the last libhdfs call on this thread. Read it in the same blocking task as
+/// the call: libhdfs sets errno on the calling thread.
+fn last_errno() -> Option<i32> {
+    std::io::Error::last_os_error().raw_os_error()
 }
 
 impl FileStatus {
@@ -487,60 +493,79 @@ impl HopsClient {
         Ok(file_reader)
     }
 
+    /// Create a file for writing. Without `opts.overwrite` the namenode creates it only if
+    /// the path does not exist, atomically, and an existing path is [HdfsError::AlreadyExists].
     pub async fn create(&self, path: &str, opts: WriteOptions) -> Result<FileWriter> {
-        let file_exists = self.check_file_exists(path).await?;
-        if file_exists && !opts.overwrite {
-            return Err(HdfsError::AlreadyExists(path.to_string()));
-        }
-
         let c_path = CString::new(path)
             .map_err(|_| HdfsError::OperationFailed("Invalid path".to_string()))?;
         let connection = self.get_connection();
         let io_runtime = self.io_runtime.clone();
+        let flags = if opts.overwrite {
+            O_WRONLY
+        } else {
+            O_WRONLY | O_CREAT | O_EXCL
+        };
 
-        let file_writer = self.spawn_blocking(move || unsafe {
-            let result = native::hdfsOpenFile(
-                connection.get_conn_ptr(),
-                c_path.as_ptr(),
-                O_WRONLY,
-                opts.buffer_size,
-                opts.replication.unwrap_or(0),
-                opts.block_size.unwrap_or(0),
-            );
+        let result = self
+            .spawn_blocking(move || unsafe {
+                let file = native::hdfsOpenFile(
+                    connection.get_conn_ptr(),
+                    c_path.as_ptr(),
+                    flags,
+                    opts.buffer_size,
+                    opts.replication.unwrap_or(0),
+                    opts.block_size.unwrap_or(0),
+                );
+                if file.is_null() {
+                    Err(last_errno())
+                } else {
+                    Ok(FileWriter::new(connection, file.cast_mut(), io_runtime))
+                }
+            })
+            .await
+            .map_err(|_| HdfsError::OperationFailed("Failed to create file".to_string()))?;
 
-            if result.is_null() {
-                Err(HdfsError::OperationFailed(
-                    "Failed to create file".to_string(),
-                ))
-            } else {
-                Ok(FileWriter::new(connection, result.cast_mut(), io_runtime))
-            }
-        })
-        .await
-        .map_err(|_| HdfsError::OperationFailed("Failed to create file".to_string()))??;
-
-        Ok(file_writer)
+        match result {
+            Ok(writer) => Ok(writer),
+            Err(Some(libc::EEXIST)) => Err(HdfsError::AlreadyExists(path.to_string())),
+            Err(errno) => Err(HdfsError::OperationFailed(format!(
+                "Failed to create file {path}, errno {errno:?}"
+            ))),
+        }
     }
 
+    /// Rename `from` to `to`. With `overwrite` an existing `to` is replaced. Without it the
+    /// namenode renames only if `to` does not exist, atomically, and an existing `to` is
+    /// [HdfsError::AlreadyExists]: of two callers renaming onto one path, exactly one wins.
     pub async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<()> {
-        let destination_exists = self.check_file_exists(to).await?;
-        if destination_exists && !overwrite {
-            Err(HdfsError::AlreadyExists(to.to_string()))?
-        }
-
         let _from = CString::new(from).unwrap();
         let _to = CString::new(to).unwrap();
         let connection = self.get_connection();
 
-        let res = self.spawn_blocking(move || unsafe {
-            native::hdfsRename(connection.get_conn_ptr(), _from.as_ptr(), _to.as_ptr())
-        })
-        .await;
+        let res = self
+            .spawn_blocking(move || unsafe {
+                let ret = if overwrite {
+                    native::hdfsRename(connection.get_conn_ptr(), _from.as_ptr(), _to.as_ptr())
+                } else {
+                    native::hdfsRename2(
+                        connection.get_conn_ptr(),
+                        _from.as_ptr(),
+                        _to.as_ptr(),
+                        native::HDFS_RENAME_NOREPLACE,
+                    )
+                };
+                if ret == 0 { Ok(()) } else { Err(last_errno()) }
+            })
+            .await
+            .map_err(|_| HdfsError::OperationFailed("rename failed!".to_string()))?;
 
-        if res.is_err() || res.unwrap() != 0 {
-            return Err(HdfsError::OperationFailed("rename failed!".to_string()));
+        match res {
+            Ok(()) => Ok(()),
+            Err(Some(libc::EEXIST)) if !overwrite => Err(HdfsError::AlreadyExists(to.to_string())),
+            Err(errno) => Err(HdfsError::OperationFailed(format!(
+                "rename {from} to {to} failed, errno {errno:?}"
+            ))),
         }
-        Ok(())
     }
 
     pub async fn delete(&self, path: &str, _recursive: bool) -> Result<bool> {
@@ -623,7 +648,7 @@ impl HopsClient {
         })
         .await;
 
-        if res.is_ok() || res.unwrap() == 0 {
+        if matches!(res, Ok(0)) {
             Ok(())
         } else {
             Err(HdfsError::OperationFailed(

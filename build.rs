@@ -99,27 +99,28 @@ fn download_and_extract_libhdfs(lib_dir: &Path) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+// Build scripts run on the host: read the target OS from cargo, so a cross build links
+// the target's library.
 fn set_libraries(out_dir: &Path, lib_dir: &Path) {
-    create_symlinks(out_dir, lib_dir, "macos", false);
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=hdfs");
-    println!("cargo:rustc-link-lib=framework=Security");
-    println!("cargo:rustc-link-lib=framework=CoreFoundation");
-    println!("cargo:rustc-link-lib=resolv");
-}
-
-#[cfg(target_os = "linux")]
-fn set_libraries(out_dir: &Path, lib_dir: &Path) {
-    create_symlinks(out_dir, lib_dir, "linux", true);
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=hdfs");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn set_libraries(_out_dir: &Path, _lib_dir: &Path) {
-    panic!("Unsupported target OS: HopsFS object store only supports macOS and Linux.");
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("macos") => {
+            create_symlinks(out_dir, lib_dir, "macos", false);
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=hdfs");
+            println!("cargo:rustc-link-lib=framework=Security");
+            println!("cargo:rustc-link-lib=framework=CoreFoundation");
+            println!("cargo:rustc-link-lib=resolv");
+        }
+        Ok("linux") => {
+            create_symlinks(out_dir, lib_dir, "linux", true);
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=hdfs");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        }
+        other => panic!(
+            "Unsupported target OS {other:?}: HopsFS object store only supports macOS and Linux."
+        ),
+    }
 }
 
 fn create_symlinks(out_dir: &Path, lib_dir: &Path, target_os: &str, shared: bool) {

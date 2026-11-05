@@ -2,7 +2,7 @@
 mod test {
     use bytes::{BufMut, Bytes, BytesMut};
     use futures::StreamExt;
-    use hopsfs_native_object_store::HdfsObjectStore;
+    use hopsfs_native_object_store::{HdfsObjectStore, HdfsObjectStoreBuilder};
     use object_store::path::Path;
     use object_store::{
         GetOptions, GetRange, GetResultPayload, ObjectStore, PutMode, PutOptions, PutPayload,
@@ -175,6 +175,56 @@ mod test {
             store.delete(path).await?;
         }
 
+        Ok(())
+    }
+
+    /// Writers on separate connections put one path with PutMode::Create at once, as Delta
+    /// writers commit one log version: exactly one put succeeds, the others get
+    /// AlreadyExists, the file holds the winner's bytes and no temp file is left behind.
+    /// HOPSFS_TEST_URL and HOPSFS_TEST_DIR point it at another cluster and a writable dir.
+    #[tokio::test]
+    async fn test_hopsfs_put_create_race() -> object_store::Result<()> {
+        let url =
+            std::env::var("HOPSFS_TEST_URL").unwrap_or_else(|_| "hdfs://127.0.0.1:8020".into());
+        let dir = std::env::var("HOPSFS_TEST_DIR").unwrap_or_default();
+        let (writers, rounds) = (8, 10);
+        let stores = (0..writers)
+            .map(|_| HdfsObjectStoreBuilder::new().with_url(&url).build())
+            .collect::<object_store::Result<Vec<_>>>()?;
+
+        for round in 0..rounds {
+            let parent = Path::from(format!("{dir}/put-create-race-{round}"));
+            let path = parent.child("00000000000000000000.json");
+            let puts = stores.iter().enumerate().map(|(i, store)| {
+                store.put_opts(
+                    &path,
+                    PutPayload::from(format!("writer-{i}")),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+            });
+            let results = futures::future::join_all(puts).await;
+
+            let winners: Vec<usize> = (0..writers).filter(|i| results[*i].is_ok()).collect();
+            assert_eq!(winners.len(), 1, "round {round}: winners {winners:?}");
+            for result in &results {
+                if let Err(e) = result {
+                    assert!(
+                        matches!(e, object_store::Error::AlreadyExists { .. }),
+                        "round {round}: a losing put failed with {e}"
+                    );
+                }
+            }
+            let got = stores[0].get(&path).await?.bytes().await?;
+            assert_eq!(got, Bytes::from(format!("writer-{}", winners[0])));
+            let listed = stores[0].list_with_delimiter(Some(&parent)).await?;
+            assert_eq!(listed.objects.len(), 1, "round {round}: {:?}", listed.objects);
+
+            stores[0].delete(&path).await?;
+            stores[0].delete(&parent).await?;
+        }
         Ok(())
     }
 }
